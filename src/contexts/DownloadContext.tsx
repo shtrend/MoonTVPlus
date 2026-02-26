@@ -1,8 +1,9 @@
 'use client';
 
-import React, { createContext, useCallback, useContext,useState } from 'react';
+import React, { createContext, useCallback, useContext, useState, useEffect } from 'react';
 
 import { M3U8Downloader, M3U8DownloadTask } from '@/lib/m3u8-downloader';
+import Toast from '@/components/Toast';
 
 interface DownloadContextType {
   downloader: M3U8Downloader;
@@ -33,6 +34,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<M3U8DownloadTask[]>([]);
   const [showDownloadPanel, setShowDownloadPanel] = useState(false);
   const [startingTaskIds, setStartingTaskIds] = useState<Set<string>>(new Set());
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' | 'info' } | null>(null);
 
   // 自动启动下一个等待的任务
   const startNextPendingTask = useCallback((currentDownloader: M3U8Downloader) => {
@@ -57,19 +59,154 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [downloader] = useState(() => new M3U8Downloader({
     onProgress: (task) => {
       setTasks(downloader.getAllTasks());
+      // 保存任务状态
+      saveTasks(downloader.getAllTasks());
     },
     onComplete: (task) => {
       setTasks(downloader.getAllTasks());
+      // 保存任务状态
+      saveTasks(downloader.getAllTasks());
       // 任务完成后，尝试启动下一个等待的任务
       startNextPendingTask(downloader);
     },
     onError: (task, error) => {
       console.error('下载错误:', error);
       setTasks(downloader.getAllTasks());
+      // 保存任务状态
+      saveTasks(downloader.getAllTasks());
       // 任务出错后，尝试启动下一个等待的任务
       startNextPendingTask(downloader);
     },
   }));
+
+  // 保存任务到 localStorage
+  const saveTasks = useCallback((tasks: M3U8DownloadTask[]) => {
+    if (typeof window === 'undefined') return;
+
+    try {
+      // 只保存必要的信息，不保存 ArrayBuffer 等无法序列化的数据
+      const tasksToSave = tasks.map(task => ({
+        id: task.id,
+        url: task.url,
+        title: task.title,
+        type: task.type,
+        status: task.status,
+        finishList: task.finishList,
+        downloadIndex: task.downloadIndex,
+        finishNum: task.finishNum,
+        errorNum: task.errorNum,
+        source: task.source,
+        videoId: task.videoId,
+        episodeIndex: task.episodeIndex,
+        downloadMode: task.downloadMode,
+        rangeDownload: task.rangeDownload,
+        m3u8Content: task.m3u8Content,
+      }));
+
+      localStorage.setItem('downloadTasks', JSON.stringify(tasksToSave));
+    } catch (error) {
+      console.error('保存任务失败:', error);
+    }
+  }, []);
+
+  // 从 localStorage 恢复任务
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const restoreTasks = async () => {
+      try {
+        const savedTasks = localStorage.getItem('downloadTasks');
+        if (!savedTasks) return;
+
+        const tasks = JSON.parse(savedTasks);
+
+        // 读取下载模式和目录句柄
+        const downloadMode = localStorage.getItem('downloadMode') as 'browser' | 'filesystem' || 'browser';
+        let dirHandle: FileSystemDirectoryHandle | undefined;
+
+        if (downloadMode === 'filesystem') {
+          const dbName = 'MoonTVPlus';
+          const storeName = 'dirHandles';
+
+          dirHandle = await new Promise<FileSystemDirectoryHandle | undefined>((resolve) => {
+            const request = indexedDB.open(dbName, 1);
+
+            request.onsuccess = (event) => {
+              const db = (event.target as IDBOpenDBRequest).result;
+
+              if (!db.objectStoreNames.contains(storeName)) {
+                db.close();
+                resolve(undefined);
+                return;
+              }
+
+              const transaction = db.transaction([storeName], 'readonly');
+              const store = transaction.objectStore(storeName);
+              const getRequest = store.get('downloadDir');
+
+              getRequest.onsuccess = () => {
+                const handle = getRequest.result as FileSystemDirectoryHandle | undefined;
+                db.close();
+                resolve(handle);
+              };
+
+              getRequest.onerror = () => {
+                db.close();
+                resolve(undefined);
+              };
+            };
+
+            request.onerror = () => {
+              resolve(undefined);
+            };
+          });
+        }
+
+        // 恢复任务
+        for (const savedTask of tasks) {
+          // 只恢复未完成的任务
+          if (savedTask.status === 'downloading' || savedTask.status === 'pause' || savedTask.status === 'ready') {
+            try {
+              const taskId = await downloader.createTask(
+                savedTask.url,
+                savedTask.title,
+                savedTask.type,
+                {
+                  source: savedTask.source,
+                  videoId: savedTask.videoId,
+                  episodeIndex: savedTask.episodeIndex,
+                }
+              );
+
+              const task = downloader.getTask(taskId);
+              if (task) {
+                // 恢复任务状态
+                task.status = savedTask.status === 'downloading' ? 'pause' : savedTask.status; // 将 downloading 改为 pause
+                task.finishList = savedTask.finishList;
+                task.downloadIndex = savedTask.downloadIndex;
+                task.finishNum = savedTask.finishNum;
+                task.errorNum = savedTask.errorNum;
+                task.downloadMode = savedTask.downloadMode;
+                task.rangeDownload = savedTask.rangeDownload;
+
+                if (dirHandle) {
+                  task.filesystemDirHandle = dirHandle;
+                }
+              }
+            } catch (error) {
+              console.error('恢复任务失败:', savedTask.title, error);
+            }
+          }
+        }
+
+        setTasks(downloader.getAllTasks());
+      } catch (error) {
+        console.error('恢复任务失败:', error);
+      }
+    };
+
+    restoreTasks();
+  }, [downloader]);
 
   const addDownloadTask = useCallback(async (
     url: string,
@@ -82,12 +219,79 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     }
   ) => {
     try {
-      const taskId = await downloader.createTask(url, title, type, metadata);
-
       // 读取下载模式设置
       const downloadMode = typeof window !== 'undefined'
         ? (localStorage.getItem('downloadMode') as 'browser' | 'filesystem') || 'browser'
         : 'browser';
+
+      // 如果是 filesystem 模式，检查是否已经下载过
+      if (downloadMode === 'filesystem' && typeof window !== 'undefined' && metadata?.source && metadata?.videoId && metadata?.episodeIndex !== undefined) {
+        try {
+          const dbName = 'MoonTVPlus';
+          const storeName = 'dirHandles';
+
+          const alreadyDownloaded = await new Promise<boolean>((resolve) => {
+            const request = indexedDB.open(dbName, 1);
+
+            request.onsuccess = async (event) => {
+              const db = (event.target as IDBOpenDBRequest).result;
+
+              if (!db.objectStoreNames.contains(storeName)) {
+                db.close();
+                resolve(false);
+                return;
+              }
+
+              const transaction = db.transaction([storeName], 'readonly');
+              const store = transaction.objectStore(storeName);
+              const getRequest = store.get('downloadDir');
+
+              getRequest.onsuccess = async () => {
+                const dirHandle = getRequest.result as FileSystemDirectoryHandle | undefined;
+                db.close();
+
+                if (!dirHandle) {
+                  resolve(false);
+                  return;
+                }
+
+                try {
+                  // 检查子目录和 playlist.m3u8 是否存在
+                  const sourceDirHandle = await dirHandle.getDirectoryHandle(metadata.source!, { create: false });
+                  const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(metadata.videoId!, { create: false });
+                  const epDirHandle = await videoIdDirHandle.getDirectoryHandle(`ep${metadata.episodeIndex! + 1}`, { create: false });
+
+                  // 只检查 playlist.m3u8 是否存在（它是最后生成的）
+                  await epDirHandle.getFileHandle('playlist.m3u8', { create: false });
+                  resolve(true);
+                } catch {
+                  // 目录或文件不存在
+                  resolve(false);
+                }
+              };
+
+              getRequest.onerror = () => {
+                db.close();
+                resolve(false);
+              };
+            };
+
+            request.onerror = () => {
+              resolve(false);
+            };
+          });
+
+          if (alreadyDownloaded) {
+            console.log('视频已下载，跳过:', title);
+            setToast({ message: `${title} 已经下载过了，无需重复下载`, type: 'info' });
+            return;
+          }
+        } catch (error) {
+          console.error('检查下载状态失败:', error);
+        }
+      }
+
+      const taskId = await downloader.createTask(url, title, type, metadata);
 
       // 如果是 filesystem 模式，从 IndexedDB 读取目录句柄
       if (downloadMode === 'filesystem' && typeof window !== 'undefined') {
@@ -250,6 +454,13 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       }}
     >
       {children}
+      {toast && (
+        <Toast
+          message={toast.message}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
     </DownloadContext.Provider>
   );
 }
