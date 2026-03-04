@@ -1,13 +1,20 @@
 /* eslint-disable no-console */
 
-import { getStorage } from './db';
+import { TOKEN_CONFIG } from './token-config';
 
-// Token 配置
-export const TOKEN_CONFIG = {
-  ACCESS_TOKEN_AGE: 4 * 60 * 60 * 1000,           // 4 小时
-  REFRESH_TOKEN_AGE: 60 * 24 * 60 * 60 * 1000,    // 60 天
-  RENEWAL_THRESHOLD: 10 * 60 * 1000,              // 剩余 10 分钟时自动续期
-};
+// Re-export TOKEN_CONFIG for backward compatibility
+export { TOKEN_CONFIG };
+
+// Lazy import to avoid Edge Runtime issues in middleware
+let getStorage: (() => any) | null = null;
+
+async function loadStorage() {
+  if (!getStorage) {
+    const db = await import('./db');
+    getStorage = db.getStorage;
+  }
+  return getStorage();
+}
 
 interface TokenData {
   token: string;
@@ -38,7 +45,7 @@ export async function storeRefreshToken(
   tokenData: TokenData
 ): Promise<void> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.hSet !== 'function') {
     console.warn('Redis Hash not supported, skipping token storage');
@@ -65,7 +72,7 @@ export async function verifyRefreshToken(
   refreshToken: string
 ): Promise<boolean> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.hGet !== 'function') {
     console.warn('Redis Hash not supported');
@@ -114,7 +121,7 @@ export async function revokeRefreshToken(
   tokenId: string
 ): Promise<void> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.hDel !== 'function') {
     console.warn('Redis Hash not supported');
@@ -138,7 +145,7 @@ export async function getUserDevices(username: string): Promise<Array<{
   expiresAt: number;
 }>> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.hGetAll !== 'function') {
     console.warn('Redis Hash not supported');
@@ -188,7 +195,7 @@ export async function getUserDevices(username: string): Promise<Array<{
 // 撤销所有 Token
 export async function revokeAllRefreshTokens(username: string): Promise<void> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.del !== 'function') {
     console.warn('Redis Hash not supported');
@@ -206,7 +213,7 @@ export async function revokeAllRefreshTokens(username: string): Promise<void> {
 // 清理过期的 Token（定期任务）
 export async function cleanupExpiredTokens(username: string): Promise<number> {
   const hashKey = `user_tokens:${username}`;
-  const storage = getStorage();
+  const storage = await loadStorage();
 
   if (!storage || typeof (storage as any).adapter?.hGetAll !== 'function') {
     return 0;

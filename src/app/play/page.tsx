@@ -48,15 +48,17 @@ import {
 import { getDoubanDetail } from '@/lib/douban.client';
 import { getTMDBImageUrl } from '@/lib/tmdb.search';
 import { DanmakuFilterConfig, EpisodeFilterConfig,SearchResult } from '@/lib/types';
-import { getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
+import { base58Decode, getVideoResolutionFromM3u8, processImageUrl } from '@/lib/utils';
 import { useEnableComments } from '@/hooks/useEnableComments';
 import { usePlaySync } from '@/hooks/usePlaySync';
 
 import AIChatPanel from '@/components/AIChatPanel';
 import CorrectDialog from '@/components/CorrectDialog';
 import DanmakuFilterSettings from '@/components/DanmakuFilterSettings';
+import DetailPanel from '@/components/DetailPanel';
 import DoubanComments from '@/components/DoubanComments';
 import DownloadEpisodeSelector from '@/components/DownloadEpisodeSelector';
+import Drawer from '@/components/Drawer';
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
 import PansouSearch from '@/components/PansouSearch';
@@ -127,6 +129,51 @@ function PlayPageClient() {
 
   // 纠错弹窗状态
   const [showCorrectDialog, setShowCorrectDialog] = useState(false);
+
+  // 详情面板状态
+  const [showDetailPanel, setShowDetailPanel] = useState(false);
+
+  // 大屏设备检测（判断选集面板是否在右侧）
+  const [isLargeScreen, setIsLargeScreen] = useState(false);
+
+  // 检测是否为大屏设备
+  useEffect(() => {
+    const checkScreenSize = () => {
+      setIsLargeScreen(window.innerWidth >= 768); // md断点
+    };
+
+    checkScreenSize();
+    window.addEventListener('resize', checkScreenSize);
+    return () => window.removeEventListener('resize', checkScreenSize);
+  }, []);
+
+  // 抽屉管理：打开指定抽屉时关闭其他抽屉
+  const openDrawer = (drawerName: 'pansou' | 'aiChat' | 'correct' | 'detail') => {
+    if (!isLargeScreen) {
+      // 小屏设备不需要互斥
+      switch (drawerName) {
+        case 'pansou':
+          setShowPansouDialog(true);
+          break;
+        case 'aiChat':
+          setShowAIChat(true);
+          break;
+        case 'correct':
+          setShowCorrectDialog(true);
+          break;
+        case 'detail':
+          setShowDetailPanel(true);
+          break;
+      }
+      return;
+    }
+
+    // 大屏设备：关闭其他抽屉
+    setShowPansouDialog(drawerName === 'pansou');
+    setShowAIChat(drawerName === 'aiChat');
+    setShowCorrectDialog(drawerName === 'correct');
+    setShowDetailPanel(drawerName === 'detail');
+  };
 
   // 检查AI功能是否启用
   useEffect(() => {
@@ -327,6 +374,39 @@ function PlayPageClient() {
       }
 
       try {
+        // 修复anime4k-webgpu库的buffer size限制问题
+        // 在全局层面patch requestAdapter，确保所有adapter都有正确的limits
+        const originalRequestAdapter = (navigator as any).gpu.requestAdapter.bind((navigator as any).gpu);
+
+        (navigator as any).gpu.requestAdapter = async (options?: any) => {
+          const adapter = await originalRequestAdapter(options);
+          if (!adapter) return adapter;
+
+          // 保存原始的requestDevice方法
+          const originalRequestDevice = adapter.requestDevice.bind(adapter);
+
+          // 重写requestDevice方法，添加必要的buffer size限制
+          adapter.requestDevice = async (descriptor?: any) => {
+            const adapterLimits = adapter.limits;
+
+            // 合并用户提供的descriptor和我们需要的limits
+            const enhancedDescriptor = {
+              ...descriptor,
+              requiredLimits: {
+                ...descriptor?.requiredLimits,
+                // 使用adapter支持的最大值，但不超过2GB
+                maxBufferSize: Math.min(adapterLimits.maxBufferSize || 2147483648, 2147483648),
+                maxStorageBufferBindingSize: Math.min(adapterLimits.maxStorageBufferBindingSize || 1073741824, 1073741824),
+              }
+            };
+
+            console.log('WebGPU设备请求配置:', enhancedDescriptor.requiredLimits);
+            return originalRequestDevice(enhancedDescriptor);
+          };
+
+          return adapter;
+        };
+
         const adapter = await (navigator as any).gpu.requestAdapter();
         if (!adapter) {
           setWebGPUSupported(false);
@@ -336,6 +416,10 @@ function PlayPageClient() {
 
         setWebGPUSupported(true);
         console.log('WebGPU支持检测：✅ 支持');
+        console.log('Adapter limits:', {
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
+        });
       } catch (err) {
         setWebGPUSupported(false);
         console.log('WebGPU不支持：', err);
@@ -488,6 +572,7 @@ function PlayPageClient() {
   const [currentSource, setCurrentSource] = useState(searchParams.get('source') || '');
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
   const [fileName] = useState(searchParams.get('fileName') || ''); // 小雅源：用户点击的文件名
+  const isDirectPlay = currentSource === 'directplay';
 
   // 解析 source 参数以获取 embyKey（仅用于 API 调用）
   const parseSourceForApi = (source: string): { source: string; embyKey?: string } => {
@@ -598,6 +683,10 @@ function PlayPageClient() {
   useEffect(() => {
     // 等待初始化完成（播放记录恢复完成）
     if (loading) {
+      return;
+    }
+
+    if (isDirectPlay) {
       return;
     }
 
@@ -938,11 +1027,19 @@ function PlayPageClient() {
     };
 
     loadDanmakuForCurrentEpisode();
-  }, [currentEpisodeIndex, videoTitle, loading]);
+  }, [currentEpisodeIndex, videoTitle, loading, isDirectPlay]);
 
   // 获取豆瓣评分数据
   useEffect(() => {
     const fetchDoubanRating = async () => {
+      if (isDirectPlay) {
+        setDoubanRating(null);
+        setDoubanCardSubtitle('');
+        setDoubanAka([]);
+        setDoubanYear('');
+        return;
+      }
+
       if (!videoDoubanId || videoDoubanId === 0) {
         setDoubanRating(null);
         setDoubanCardSubtitle('');
@@ -994,11 +1091,16 @@ function PlayPageClient() {
     };
 
     fetchDoubanRating();
-  }, [videoDoubanId]);
+  }, [videoDoubanId, isDirectPlay]);
 
   // 获取TMDB背景图
   useEffect(() => {
     const fetchTMDBBackdrop = async () => {
+      if (isDirectPlay) {
+        setTmdbBackdrop(null);
+        return;
+      }
+
       // 检查是否禁用背景图
       if (typeof window !== 'undefined') {
         const disabled = localStorage.getItem('tmdb_backdrop_disabled');
@@ -1146,7 +1248,7 @@ function PlayPageClient() {
     };
 
     fetchTMDBBackdrop();
-  }, [videoTitle, videoDoubanId]);
+  }, [videoTitle, videoDoubanId, isDirectPlay]);
 
 
   // 视频播放地址
@@ -1168,6 +1270,14 @@ function PlayPageClient() {
 
   // 总集数
   const totalEpisodes = detail?.episodes?.length || 0;
+  const directEpisodeLabel = detail?.episodes_titles?.[currentEpisodeIndex] || '直链';
+  const shouldShowEpisodeLabel = totalEpisodes > 1 || isDirectPlay;
+  const episodeLabel = isDirectPlay
+    ? directEpisodeLabel
+    : detail?.episodes_titles?.[currentEpisodeIndex] || `第 ${currentEpisodeIndex + 1} 集`;
+  const playerEpisodeLabel = isDirectPlay
+    ? directEpisodeLabel
+    : `第${currentEpisodeIndex + 1}集`;
 
   // 用于记录是否需要在播放器 ready 后跳转到指定进度
   const resumeTimeRef = useRef<number | null>(null);
@@ -1203,6 +1313,14 @@ function PlayPageClient() {
   const [precomputedVideoInfo, setPrecomputedVideoInfo] = useState<
     Map<string, { quality: string; loadSpeed: string; pingTime: number; bitrate: string }>
   >(new Map());
+
+  // 当前源的视频信息（用于标题旁边显示）
+  const [currentSourceVideoInfo, setCurrentSourceVideoInfo] = useState<{
+    quality: string;
+    loadSpeed: string;
+    pingTime: number;
+    bitrate: string;
+  } | null>(null);
 
   // 折叠状态（仅在 lg 及以上屏幕有效）
   const [isEpisodeSelectorCollapsed, setIsEpisodeSelectorCollapsed] =
@@ -1290,11 +1408,48 @@ function PlayPageClient() {
     return 'unknown';
   };
 
+  // 获取当前源的视频信息（分辨率和码率）
+  const fetchCurrentSourceVideoInfo = async () => {
+    if (!detail || !detail.episodes || detail.episodes.length === 0) {
+      return;
+    }
+
+    // 获取当前集数的播放地址
+    const episodeUrl = detail.episodes[currentEpisodeIndex];
+    if (!episodeUrl) {
+      return;
+    }
+
+    try {
+      const info = await getVideoResolutionFromM3u8(episodeUrl, 4000);
+      setCurrentSourceVideoInfo(info);
+    } catch (error) {
+      console.error('获取视频信息失败:', error);
+      setCurrentSourceVideoInfo(null);
+    }
+  };
+
   // 播放源优选函数
   const preferBestSource = async (
     sources: SearchResult[]
   ): Promise<SearchResult> => {
     if (sources.length === 1) return sources[0];
+
+    // 获取配置以获取权重信息
+    let weightMap = new Map<string, number>();
+    try {
+      const configResponse = await fetch('/api/admin/config');
+      if (configResponse.ok) {
+        const configData = await configResponse.json();
+        if (configData.Config?.SourceConfig) {
+          configData.Config.SourceConfig.forEach((source: any) => {
+            weightMap.set(source.key, source.weight ?? 0);
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('获取配置失败，权重将使用默认值0:', error);
+    }
 
     // 将播放源均分为两批，并发测速各批，避免一次性过多请求
     const batchSize = Math.ceil(sources.length / 2);
@@ -1362,9 +1517,15 @@ function PlayPageClient() {
 
     setPrecomputedVideoInfo(newVideoInfoMap);
 
+    // 如果所有测速都失败，仍然按权重排序返回
     if (successfulResults.length === 0) {
-      console.warn('所有播放源测速都失败，使用第一个播放源');
-      return sources[0];
+      console.warn('所有播放源测速都失败，按权重排序');
+      const sortedByWeight = [...sources].sort((a, b) => {
+        const weightA = weightMap.get(a.source) ?? 0;
+        const weightB = weightMap.get(b.source) ?? 0;
+        return weightB - weightA;
+      });
+      return sortedByWeight[0];
     }
 
     // 找出所有有效速度的最大值，用于线性映射
@@ -1399,7 +1560,8 @@ function PlayPageClient() {
         result.testResult,
         maxSpeed,
         minPing,
-        maxPing
+        maxPing,
+        weightMap.get(result.source.source) ?? 0
       ),
     }));
 
@@ -1429,7 +1591,8 @@ function PlayPageClient() {
     },
     maxSpeed: number,
     minPing: number,
-    maxPing: number
+    maxPing: number,
+    weight: number = 0
   ): number => {
     let score = 0;
 
@@ -1487,6 +1650,9 @@ function PlayPageClient() {
     })();
     score += pingScore * 0.2;
 
+    // 权重加分 - 直接加到总分上（0-100分）
+    score += weight;
+
     return Math.round(score * 100) / 100; // 保留两位小数
   };
 
@@ -1514,6 +1680,117 @@ function PlayPageClient() {
     }
 
     return false;
+  };
+
+  /**
+   * 检查 File System API 本地下载
+   */
+  const checkFileSystemDownload = async (
+    title: string,
+    source?: string,
+    videoId?: string,
+    episodeIndex?: number
+  ): Promise<{ hasLocal: boolean; dirHandle?: FileSystemDirectoryHandle }> => {
+    try {
+      // 从 IndexedDB 读取目录句柄
+      const dbName = 'MoonTVPlus';
+      const storeName = 'dirHandles';
+
+      return new Promise((resolve) => {
+        const request = indexedDB.open(dbName, 2); // 使用版本 2
+
+        request.onupgradeneeded = (event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+
+          // 创建 dirHandles 表（如果不存在）
+          if (!db.objectStoreNames.contains(storeName)) {
+            db.createObjectStore(storeName);
+          }
+
+          // 创建 activeTasks 表（如果不存在）
+          if (!db.objectStoreNames.contains('activeTasks')) {
+            const activeStore = db.createObjectStore('activeTasks', { keyPath: 'id' });
+            activeStore.createIndex('status', 'status', { unique: false });
+            activeStore.createIndex('createdAt', 'createdAt', { unique: false });
+          }
+
+          // 创建 completedTasks 表（如果不存在）
+          if (!db.objectStoreNames.contains('completedTasks')) {
+            const completedStore = db.createObjectStore('completedTasks', { keyPath: 'id' });
+            completedStore.createIndex('source', 'source', { unique: false });
+            completedStore.createIndex('videoId', 'videoId', { unique: false });
+            completedStore.createIndex('completedAt', 'completedAt', { unique: false });
+            completedStore.createIndex('sourceVideoId', ['source', 'videoId'], { unique: false });
+          }
+        };
+
+        request.onsuccess = async (event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+
+          // 检查 object store 是否存在
+          if (!db.objectStoreNames.contains(storeName)) {
+            db.close();
+            resolve({ hasLocal: false });
+            return;
+          }
+
+          const transaction = db.transaction([storeName], 'readonly');
+          const store = transaction.objectStore(storeName);
+          const getRequest = store.get('downloadDir');
+
+          getRequest.onsuccess = async () => {
+            const dirHandle = getRequest.result as FileSystemDirectoryHandle | undefined;
+            if (!dirHandle) {
+              resolve({ hasLocal: false });
+              return;
+            }
+
+            try {
+              // 请求读权限
+              const permission = await (dirHandle as any).queryPermission({ mode: 'read' });
+              if (permission !== 'granted') {
+                const requestPermission = await (dirHandle as any).requestPermission({ mode: 'read' });
+                if (requestPermission !== 'granted') {
+                  console.warn('未获得读权限');
+                  resolve({ hasLocal: false });
+                  return;
+                }
+              }
+
+              // 如果有 source、videoId 和 episodeIndex，检查子目录
+              if (source && videoId && episodeIndex !== undefined) {
+                const sourceDirHandle = await dirHandle.getDirectoryHandle(source, { create: false });
+                const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(videoId, { create: false });
+                const epDirHandle = await videoIdDirHandle.getDirectoryHandle(`ep${episodeIndex + 1}`, { create: false });
+
+                // 检查是否存在 playlist.m3u8 文件
+                await epDirHandle.getFileHandle('playlist.m3u8', { create: false });
+                console.log('找到本地下载文件:', title, `(${source}/${videoId}/ep${episodeIndex + 1})`);
+                resolve({ hasLocal: true, dirHandle: epDirHandle });
+              } else {
+                // 缺少必要参数
+                resolve({ hasLocal: false });
+              }
+            } catch (error) {
+              // 文件不存在
+              console.error('检查本地文件失败:', error);
+              resolve({ hasLocal: false });
+            }
+          };
+
+          getRequest.onerror = () => {
+            resolve({ hasLocal: false });
+          };
+        };
+
+        request.onerror = () => {
+          resolve({ hasLocal: false });
+        };
+      });
+    } catch (error) {
+      console.error('检查 File System API 下载失败:', error);
+      return { hasLocal: false };
+    }
   };
 
   /**
@@ -1752,19 +2029,13 @@ function PlayPageClient() {
     clearRefreshTimer(); // 清除旧的定时器
     isInitialLoadRef.current = true; // 重置为首次加载
 
-    // 动态设置 referrer policy：只在小雅源时不发送 Referer
+    // 动态设置 referrer policy：不发送 Referer
     const existingMeta = document.querySelector('meta[name="referrer"]');
-    if (detailData?.source === 'xiaoya') {
-      if (!existingMeta) {
-        const meta = document.createElement('meta');
-        meta.name = 'referrer';
-        meta.content = 'no-referrer';
-        document.head.appendChild(meta);
-      }
-    } else {
-      if (existingMeta) {
-        existingMeta.remove();
-      }
+    if (!existingMeta) {
+      const meta = document.createElement('meta');
+      meta.name = 'referrer';
+      meta.content = 'no-referrer';
+      document.head.appendChild(meta);
     }
 
     if (
@@ -1813,17 +2084,94 @@ function PlayPageClient() {
       setVideoQualities([]);
     }
 
-    // 检查是否有本地下载的文件
-    const hasLocalFile = await checkLocalDownload(currentSource, currentId, episodeIndex);
+    // 检查是否有 File System API 本地下载的文件
+    const episodeTitle = detailData?.episodes_titles?.[episodeIndex] || `第${episodeIndex + 1}集`;
+    const fileSystemCheck = await checkFileSystemDownload(
+      episodeTitle,
+      currentSource || undefined,
+      currentId || undefined,
+      episodeIndex
+    );
 
-    if (hasLocalFile) {
-      // 使用本地代理接口,URL以.m3u8结尾以便Artplayer自动识别
-      newUrl = `/api/offline-download/local/${currentSource}/${currentId}/${episodeIndex}/playlist.m3u8`;
-      console.log('使用本地下载文件播放:', newUrl);
-    } else if (sourceProxyMode && newUrl) {
-      // 如果视频源启用了代理模式,且不是本地下载,则通过代理播放
-      newUrl = `/api/proxy/vod/m3u8?url=${encodeURIComponent(newUrl)}&source=${encodeURIComponent(currentSource)}`;
-      console.log('使用代理模式播放:', newUrl);
+    if (fileSystemCheck.hasLocal && fileSystemCheck.dirHandle) {
+      // 使用本地文件播放
+      try {
+        // 读取 m3u8 文件
+        const fileHandle = await fileSystemCheck.dirHandle.getFileHandle('playlist.m3u8', { create: false });
+        const file = await fileHandle.getFile();
+        let content = await file.text();
+
+        // 解析 m3u8 文件，为每个 ts 文件创建 Blob URL
+        const lines = content.split('\n');
+        const modifiedLines: string[] = [];
+        const blobUrls: string[] = []; // 保存 Blob URL 以便后续清理
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+
+          // 如果是 ts 文件
+          if (trimmedLine.endsWith('.ts')) {
+            try {
+              // 读取 ts 文件
+              const tsFileHandle = await fileSystemCheck.dirHandle.getFileHandle(trimmedLine, { create: false });
+              const tsFile = await tsFileHandle.getFile();
+
+              // 创建 Blob URL
+              const blobUrl = URL.createObjectURL(tsFile);
+              blobUrls.push(blobUrl);
+
+              // 替换为 Blob URL
+              modifiedLines.push(line.replace(trimmedLine, blobUrl));
+            } catch (error) {
+              console.error(`读取 ts 文件失败: ${trimmedLine}`, error);
+              modifiedLines.push(line);
+            }
+          }
+          // 如果是加密密钥
+          else if (trimmedLine.includes('key.key')) {
+            try {
+              const keyFileHandle = await fileSystemCheck.dirHandle.getFileHandle('key.key', { create: false });
+              const keyFile = await keyFileHandle.getFile();
+              const keyBlobUrl = URL.createObjectURL(keyFile);
+              blobUrls.push(keyBlobUrl);
+              modifiedLines.push(line.replace('key.key', keyBlobUrl));
+            } catch (error) {
+              console.error('读取密钥文件失败:', error);
+              modifiedLines.push(line);
+            }
+          }
+          else {
+            modifiedLines.push(line);
+          }
+        }
+
+        // 创建修改后的 m3u8 的 Blob URL
+        const modifiedContent = modifiedLines.join('\n');
+        const m3u8Blob = new Blob([modifiedContent], { type: 'application/vnd.apple.mpegurl' });
+        newUrl = URL.createObjectURL(m3u8Blob);
+
+        // 保存 Blob URLs 到 window，以便在切换视频时清理
+        (window as any).__localFileBlobUrls = blobUrls;
+
+        console.log('使用 File System API 本地文件播放（Blob URL 模式）:', episodeTitle);
+      } catch (error) {
+        console.error('读取本地文件失败:', error);
+      }
+    }
+
+    // 如果没有 File System API 本地文件，检查服务器端本地下载
+    if (!fileSystemCheck.hasLocal) {
+      const hasLocalFile = await checkLocalDownload(currentSource, currentId, episodeIndex);
+
+      if (hasLocalFile) {
+        // 使用本地代理接口,URL以.m3u8结尾以便Artplayer自动识别
+        newUrl = `/api/offline-download/local/${currentSource}/${currentId}/${episodeIndex}/playlist.m3u8`;
+        console.log('使用服务器端本地下载文件播放:', newUrl);
+      } else if (sourceProxyMode && newUrl) {
+        // 如果视频源启用了代理模式,且不是本地下载,则通过代理播放
+        newUrl = `/api/proxy/vod/m3u8?url=${encodeURIComponent(newUrl)}&source=${encodeURIComponent(currentSource)}`;
+        console.log('使用代理模式播放:', newUrl);
+      }
     }
 
     if (newUrl !== videoUrl) {
@@ -1906,7 +2254,11 @@ function PlayPageClient() {
         // M3U8格式 - 使用新的下载器，TS 格式
         try {
           const downloadTitle = `${videoTitle}_第${episodeIndex + 1}集`;
-          await addDownloadTask(proxyUrl, downloadTitle, 'TS');
+          await addDownloadTask(proxyUrl, downloadTitle, 'TS', {
+            source: currentSource || undefined,
+            videoId: currentId || undefined,
+            episodeIndex,
+          });
           successCount++;
         } catch (error) {
           console.error(`添加下载任务失败 (第${episodeIndex + 1}集):`, error);
@@ -2808,6 +3160,73 @@ function PlayPageClient() {
     };
 
     const initAll = async () => {
+      if (currentSource === 'directplay') {
+        if (!currentId) {
+          setError('缺少直链地址');
+          setLoading(false);
+          return;
+        }
+
+        setLoading(true);
+        setLoadingStage('fetching');
+        setLoadingMessage('🎬 正在准备直链播放...');
+
+        let directUrl = '';
+        try {
+          directUrl = base58Decode(currentId);
+        } catch (decodeError) {
+          console.error('直链地址解析失败:', decodeError);
+          setError('直链地址解析失败');
+          setLoading(false);
+          return;
+        }
+
+        const directDetail: SearchResult = {
+          id: currentId,
+          title: '直链播放',
+          poster: '',
+          episodes: [directUrl],
+          episodes_titles: ['直链'],
+          source: 'directplay',
+          source_name: '直链',
+          class: '',
+          year: '',
+          desc: '',
+          type_name: '',
+          douban_id: 0,
+        };
+
+        setNeedPrefer(false);
+        setCurrentSource('directplay');
+        setCurrentId(currentId);
+        setVideoTitle('直链播放');
+        setVideoYear('');
+        setVideoCover('');
+        setVideoDoubanId(0);
+        setCorrectedDesc('');
+        setDetail(directDetail);
+        setSourceProxyMode(false);
+        setAvailableSources([directDetail]);
+        setCurrentEpisodeIndex(0);
+        setSourceSearchError(null);
+        setSourceSearchLoading(false);
+        setBackgroundSourcesLoading(false);
+
+        const newUrl = new URL(window.location.href);
+        newUrl.searchParams.set('source', 'directplay');
+        newUrl.searchParams.set('id', currentId);
+        newUrl.searchParams.delete('prefer');
+        newUrl.searchParams.delete('fileName');
+        window.history.replaceState({}, '', newUrl.toString());
+
+        setLoadingStage('ready');
+        setLoadingMessage('✨ 准备就绪，即将开始播放...');
+        setTimeout(() => {
+          setLoading(false);
+        }, 500);
+        return;
+      }
+
       if (!currentSource && !currentId && !videoTitle && !searchTitle) {
         setError('缺少必要参数');
         setLoading(false);
@@ -3132,6 +3551,13 @@ function PlayPageClient() {
       }
     }
   }, [searchParams, currentSource, currentId, availableSources, currentEpisodeIndex]);
+
+  // 监听 detail 和 currentEpisodeIndex 变化，自动获取视频信息
+  useEffect(() => {
+    if (detail && detail.episodes && detail.episodes.length > 0) {
+      fetchCurrentSourceVideoInfo();
+    }
+  }, [detail, currentEpisodeIndex]);
 
   // 监听 detail 和 currentEpisodeIndex 变化，动态更新字幕
   useEffect(() => {
@@ -3698,6 +4124,7 @@ function PlayPageClient() {
   // 预加载下一集弹幕（完全复制 loadDanmakuForCurrentEpisode 的逻辑）
   const preloadNextEpisodeDanmaku = async () => {
     try {
+      if (isDirectPlay) return;
       const disableAutoLoad = localStorage.getItem('disableAutoLoadDanmaku') === 'true';
       if (disableAutoLoad) return;
 
@@ -4043,6 +4470,7 @@ function PlayPageClient() {
 
   // 自动搜索并加载弹幕
   const autoSearchDanmaku = async () => {
+    if (isDirectPlay) return;
     const disableAutoLoad = localStorage.getItem('disableAutoLoadDanmaku') === 'true';
     if (disableAutoLoad) return;
 
@@ -4616,9 +5044,7 @@ function PlayPageClient() {
     // 非WebKit浏览器且播放器已存在，使用switch方法切换
     if (!isWebkit && artPlayerRef.current) {
       artPlayerRef.current.switch = videoUrl;
-      artPlayerRef.current.title = `${videoTitle} - 第${
-        currentEpisodeIndex + 1
-      }集`;
+      artPlayerRef.current.title = `${videoTitle} - ${playerEpisodeLabel}`;
       artPlayerRef.current.poster = videoCover;
       if (artPlayerRef.current?.video) {
         ensureVideoSource(
@@ -4727,7 +5153,7 @@ function PlayPageClient() {
         moreVideoAttr: {
           playsInline: true,
           'webkit-playsinline': 'true',
-          ...(detail?.source === 'xiaoya' ? { referrerpolicy: 'no-referrer' } : {}),
+          referrerpolicy: 'no-referrer',
         } as any,
         // HLS 支持配置
         customType: {
@@ -4787,6 +5213,16 @@ function PlayPageClient() {
 
             const bufferConfig = getBufferConfig(bufferStrategy);
 
+            // 选择合适的 Loader
+            let loaderClass;
+            if (shouldUseCustomLoader) {
+              // 使用自定义广告过滤 Loader
+              loaderClass = CustomHlsJsLoader;
+            } else {
+              // 使用默认 Loader
+              loaderClass = Hls.DefaultConfig.loader;
+            }
+
             const hls = new Hls({
               debug: false, // 关闭日志
               enableWorker: true, // WebWorker 解码，降低主线程压力
@@ -4798,9 +5234,7 @@ function PlayPageClient() {
               maxBufferSize: bufferConfig.maxBufferSize, // 最大缓冲大小
 
               /* 自定义loader */
-              loader: (shouldUseCustomLoader
-                ? CustomHlsJsLoader
-                : Hls.DefaultConfig.loader) as any,
+              loader: loaderClass as any,
             });
 
             hls.loadSource(url);
@@ -5657,6 +6091,85 @@ function PlayPageClient() {
         setPlayerReady(true);
         console.log('[PlayPage] Player ready, triggering sync setup');
 
+        // 应用进度条图标配置 - 尽早执行
+        const applyProgressThumbConfig = () => {
+          try {
+            const config = (window as any).RUNTIME_CONFIG;
+
+            if (!config || config.PROGRESS_THUMB_TYPE === 'default') {
+              // 使用默认样式，移除自定义样式
+              const oldStyle = document.getElementById('custom-progress-thumb-style');
+              if (oldStyle) oldStyle.remove();
+              return;
+            }
+
+            let thumbUrl = '';
+            let thumbColor = '#22c55e'; // 默认绿色
+
+            if (config.PROGRESS_THUMB_TYPE === 'preset' && config.PROGRESS_THUMB_PRESET_ID) {
+              const presetConfig: Record<string, { url: string; color: string }> = {
+                renako: { url: '/icons/q/renako.png', color: '#ec4899' }, // 粉色
+                irena: { url: '/icons/q/irena.png', color: '#f8fafc' }, // 雪白色
+                emilia: { url: '/icons/q/emilia.png', color: '#f8fafc' }, // 雪白色
+              };
+              const preset = presetConfig[config.PROGRESS_THUMB_PRESET_ID];
+              if (preset) {
+                thumbUrl = preset.url;
+                thumbColor = preset.color;
+              }
+            } else if (config.PROGRESS_THUMB_TYPE === 'custom' && config.PROGRESS_THUMB_CUSTOM_URL) {
+              thumbUrl = config.PROGRESS_THUMB_CUSTOM_URL;
+            }
+
+            // 修改 ArtPlayer 的主题色
+            if (artPlayerRef.current) {
+              artPlayerRef.current.theme = thumbColor;
+            }
+
+            if (thumbUrl) {
+              // 根据预设ID确定尺寸
+              let width = '30px';
+              let height = '30px';
+              let marginLeft = '-15px';
+
+              // renako 图标特殊处理（288x404比例，放大1.25倍）
+              if (config.PROGRESS_THUMB_TYPE === 'preset' && config.PROGRESS_THUMB_PRESET_ID === 'renako') {
+                width = '26.875px'; // 21.5 * 1.25
+                height = '37.5px'; // 30 * 1.25
+                marginLeft = '-13.4375px'; // 10.75 * 1.25
+              }
+
+              // 动态设置背景图片
+              const style = document.createElement('style');
+              style.id = 'custom-progress-thumb-style';
+              style.textContent = `
+                /* 替换默认的进度条圆点为自定义图标 */
+                .art-video-player .art-progress-indicator {
+                  width: ${width} !important;
+                  height: ${height} !important;
+                  background-image: url('${thumbUrl}') !important;
+                  background-size: contain !important;
+                  background-repeat: no-repeat !important;
+                  background-position: center !important;
+                  background-color: transparent !important;
+                  border-radius: 0 !important;
+                  margin-left: ${marginLeft} !important;
+                }
+              `;
+
+              // 移除旧样式
+              const oldStyle = document.getElementById('custom-progress-thumb-style');
+              if (oldStyle) oldStyle.remove();
+
+              document.head.appendChild(style);
+            }
+          } catch (error) {
+            console.error('[进度条图标] 应用配置失败:', error);
+          }
+        };
+
+        applyProgressThumbConfig();
+
         // 添加字幕切换功能
         const currentSubtitles = detailRef.current?.subtitles?.[currentEpisodeIndex] || [];
         if (currentSubtitles.length > 0 && artPlayerRef.current) {
@@ -5876,7 +6389,7 @@ function PlayPageClient() {
               saveDanmakuDisplayState(false);
             });
           }
-         
+
         }
 
         // 播放器就绪后，如果正在播放则请求 Wake Lock
@@ -6654,7 +7167,7 @@ function PlayPageClient() {
 
     // 调用异步初始化函数
     initPlayer();
-  }, [videoUrl, loading, blockAdEnabled, currentEpisodeIndex]);
+  }, [videoUrl, loading, blockAdEnabled]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
@@ -6993,12 +7506,9 @@ function PlayPageClient() {
           <h1 className={`text-xl font-semibold flex items-center gap-2 flex-wrap ${tmdbBackdrop ? 'text-white' : 'text-gray-900 dark:text-gray-100'}`}>
             <span>
               {videoTitle || '影片标题'}
-              {totalEpisodes > 1 && (
+              {shouldShowEpisodeLabel && (
                 <span className={tmdbBackdrop ? 'text-white opacity-80' : 'text-gray-500 dark:text-gray-400'}>
-                  {` > ${
-                    detail?.episodes_titles?.[currentEpisodeIndex] ||
-                    `第 ${currentEpisodeIndex + 1} 集`
-                  }`}
+                  {` > ${episodeLabel}`}
                 </span>
               )}
             </span>
@@ -7302,6 +7812,37 @@ function PlayPageClient() {
                           </span>
                         </button>
 
+                        {/* App打开 */}
+                        <button
+                          onClick={(e) => {
+                            e.preventDefault();
+                            // 获取当前浏览器URL去除域名部分，并去除开头的/
+                            const currentPath = (window.location.pathname + window.location.search).replace(/^\//, '');
+                            // 打开moontvplus协议
+                            window.open(`moontvplus://${currentPath}`, '_blank');
+                          }}
+                          className='group relative flex items-center justify-center gap-1 w-8 h-8 lg:w-auto lg:h-auto lg:px-2 lg:py-1.5 bg-blue-500 hover:bg-blue-600 dark:bg-blue-600 dark:hover:bg-blue-700 text-xs font-medium rounded-md transition-all duration-200 shadow-sm hover:shadow-md cursor-pointer overflow-hidden border border-blue-600 dark:border-blue-700 flex-shrink-0'
+                          title='App打开'
+                        >
+                          <svg
+                            className='w-4 h-4 flex-shrink-0 text-white'
+                            fill='none'
+                            stroke='currentColor'
+                            viewBox='0 0 24 24'
+                            xmlns='http://www.w3.org/2000/svg'
+                          >
+                            <path
+                              strokeLinecap='round'
+                              strokeLinejoin='round'
+                              strokeWidth={2}
+                              d='M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z'
+                            />
+                          </svg>
+                          <span className='hidden lg:inline max-w-0 group-hover:max-w-[100px] overflow-hidden whitespace-nowrap transition-all duration-200 ease-in-out text-white'>
+                            App打开
+                          </span>
+                        </button>
+
                         {/* PotPlayer */}
                         <button
                           onClick={(e) => {
@@ -7568,254 +8109,284 @@ function PlayPageClient() {
           </div>
         </div>
 
-        {/* 详情展示 */}
-        <div className='grid grid-cols-1 md:grid-cols-5 lg:grid-cols-6 gap-4'>
-          {/* 文字区 */}
-          <div className='md:col-span-4 lg:col-span-5'>
-            <div className='p-6 flex flex-col min-h-0'>
-              {/* 标题 */}
-              <h1 className={`text-3xl font-bold mb-2 tracking-wide flex items-center flex-shrink-0 text-center md:text-left w-full flex-wrap gap-2 ${tmdbBackdrop ? 'text-white' : 'text-gray-900 dark:text-gray-100'}`}>
-                <span className={doubanAka.length > 0 ? 'relative group cursor-help' : ''}>
-                  {videoTitle || '影片标题'}
-                  {/* aka 悬浮提示 */}
-                  {doubanAka.length > 0 && (
-                    <div className='absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-800 dark:bg-gray-900 text-white text-sm rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 ease-out whitespace-nowrap z-[100] pointer-events-none'>
-                      <div className='font-semibold text-xs text-gray-400 mb-1'>又名：</div>
-                      {doubanAka.map((name, index) => (
-                        <div key={index} className='text-sm'>
-                          {name}
+        {!isDirectPlay && (
+          <>
+            {/* 详情展示 */}
+            <div className='grid grid-cols-1 md:grid-cols-5 lg:grid-cols-6 gap-4'>
+              {/* 文字区 */}
+              <div className='md:col-span-4 lg:col-span-5'>
+                <div className='p-6 flex flex-col min-h-0'>
+                  {/* 标题 */}
+                  <h1 className={`text-3xl font-bold mb-2 tracking-wide flex items-center flex-shrink-0 text-center md:text-left w-full flex-wrap gap-2 ${tmdbBackdrop ? 'text-white' : 'text-gray-900 dark:text-gray-100'}`}>
+                    <span className={doubanAka.length > 0 ? 'relative group cursor-help' : ''}>
+                      {videoTitle || '影片标题'}
+                      {/* aka 悬浮提示 */}
+                      {doubanAka.length > 0 && (
+                        <div className='absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-800 dark:bg-gray-900 text-white text-sm rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 ease-out whitespace-nowrap z-[100] pointer-events-none'>
+                          <div className='font-semibold text-xs text-gray-400 mb-1'>又名：</div>
+                          {doubanAka.map((name, index) => (
+                            <div key={index} className='text-sm'>
+                              {name}
+                            </div>
+                          ))}
+                          <div className='absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800 dark:border-t-gray-900'></div>
                         </div>
-                      ))}
-                      <div className='absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800 dark:border-t-gray-900'></div>
-                    </div>
-                  )}
-                </span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleToggleFavorite();
-                  }}
-                  className='flex-shrink-0 hover:opacity-80 transition-opacity'
-                >
-                  <FavoriteIcon filled={favorited} />
-                </button>
-                {/* 网盘搜索按钮 */}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setShowPansouDialog(true);
-                  }}
-                  className='flex-shrink-0 hover:opacity-80 transition-opacity'
-                  title='搜索网盘资源'
-                >
-                  <Cloud className='h-6 w-6 text-gray-700 dark:text-gray-300' />
-                </button>
-                {/* AI问片按钮 */}
-                {aiEnabled && detail && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowAIChat(true);
-                    }}
-                    className='flex-shrink-0 hover:opacity-80 transition-opacity'
-                    title='AI问片'
-                  >
-                    <Sparkles className='h-6 w-6 text-gray-700 dark:text-gray-300' />
-                  </button>
-                )}
-                {/* 纠错按钮 - 仅小雅源显示 */}
-                {detail && detail.source === 'xiaoya' && (
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowCorrectDialog(true);
-                    }}
-                    className='flex-shrink-0 hover:opacity-80 transition-opacity'
-                    title='纠错'
-                  >
-                    <AlertCircle className='h-6 w-6 text-gray-700 dark:text-gray-300' />
-                  </button>
-                )}
-                {/* 豆瓣评分显示 */}
-                {doubanRating && doubanRating.value > 0 && (
-                  <div className='flex items-center gap-2 text-base font-normal'>
-                    {/* 星级显示 */}
-                    <div className='flex items-center gap-1'>
-                      {[1, 2, 3, 4, 5].map((star) => {
-                        const starValue = doubanRating.value / 2; // 转换为5星制
-                        const isFullStar = star <= Math.floor(starValue);
-                        const isHalfStar = !isFullStar && star <= Math.ceil(starValue) && starValue % 1 >= 0.25;
-
-                        return (
-                          <div key={star} className='relative w-5 h-5'>
-                            {isFullStar ? (
-                              // 全星
-                              <svg
-                                className='w-5 h-5 text-yellow-400 fill-yellow-400'
-                                viewBox='0 0 24 24'
-                                xmlns='http://www.w3.org/2000/svg'
-                              >
-                                <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
-                              </svg>
-                            ) : isHalfStar ? (
-                              // 半星
-                              <>
-                                {/* 空星背景 */}
-                                <svg
-                                  className='absolute w-5 h-5 text-gray-300 dark:text-gray-600 fill-gray-300 dark:fill-gray-600'
-                                  viewBox='0 0 24 24'
-                                  xmlns='http://www.w3.org/2000/svg'
-                                >
-                                  <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
-                                </svg>
-                                {/* 半星遮罩 */}
-                                <svg
-                                  className='absolute w-5 h-5 text-yellow-400 fill-yellow-400'
-                                  viewBox='0 0 24 24'
-                                  xmlns='http://www.w3.org/2000/svg'
-                                  style={{ clipPath: 'inset(0 50% 0 0)' }}
-                                >
-                                  <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
-                                </svg>
-                              </>
-                            ) : (
-                              // 空星
-                              <svg
-                                className='w-5 h-5 text-gray-300 dark:text-gray-600 fill-gray-300 dark:fill-gray-600'
-                                viewBox='0 0 24 24'
-                                xmlns='http://www.w3.org/2000/svg'
-                              >
-                                <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
-                              </svg>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                    {/* 评分数值 */}
-                    <span className='text-gray-700 dark:text-gray-300 font-semibold'>
-                      {doubanRating.value.toFixed(1)}
+                      )}
                     </span>
-                    {/* 评分人数 */}
-                    <span className='text-gray-500 dark:text-gray-400 text-sm'>
-                      ({doubanRating.count.toLocaleString()}人评价)
-                    </span>
-                  </div>
-                )}
-              </h1>
-
-              {/* 关键信息行 */}
-              <div className={`flex flex-wrap items-center gap-3 text-base mb-4 opacity-80 flex-shrink-0 ${tmdbBackdrop ? 'text-white' : ''}`}>
-                {detail?.class && (
-                  <span className='text-green-600 font-semibold'>
-                    {detail.class}
-                  </span>
-                )}
-                {/* 优先使用 doubanYear，如果没有则使用 detail.year 或 videoYear */}
-                {(doubanYear || detail?.year || videoYear) && (
-                  <span>{doubanYear || detail?.year || videoYear}</span>
-                )}
-                {detail?.source_name && (
-                  <span className={`border px-2 py-[1px] rounded ${
-                    detail.source === 'xiaoya' ? 'border-blue-500' : detail.source === 'openlist' || detail.source === 'emby' || detail.source?.startsWith('emby_') ? 'border-yellow-500' : 'border-gray-500/60'
-                  }`}>
-                    {detail.source_name}
-                  </span>
-                )}
-                {detail?.type_name && <span>{detail.type_name}</span>}
-              </div>
-              {/* 剧情简介 */}
-              {(doubanCardSubtitle || correctedDesc || detail?.desc) && (
-                <div
-                  className={`mt-0 text-base leading-relaxed opacity-90 overflow-y-auto pr-2 flex-1 min-h-0 scrollbar-hide ${tmdbBackdrop ? 'text-white' : ''}`}
-                  style={{ whiteSpace: 'pre-line' }}
-                >
-                  {/* card_subtitle 在前，desc 在后 */}
-                  {doubanCardSubtitle && (
-                    <div className='mb-3 pb-3 border-b border-gray-300 dark:border-gray-700'>
-                      {doubanCardSubtitle}
-                    </div>
-                  )}
-                  {correctedDesc || detail?.desc}
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* 封面展示 */}
-          <div className='hidden md:block md:col-span-1 md:order-first'>
-            <div className='pl-0 py-4 pr-6 max-w-sm mx-auto'>
-              <div className='relative bg-gray-300 dark:bg-gray-700 aspect-[2/3] flex items-center justify-center rounded-xl overflow-hidden'>
-                {videoCover ? (
-                  <>
-                    <img
-                      src={processImageUrl(videoCover)}
-                      alt={videoTitle}
-                      className='w-full h-full object-cover'
-                    />
-
-                    {/* 豆瓣链接按钮 */}
-                    {videoDoubanId !== 0 && (
-                      <a
-                        href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
-                        target='_blank'
-                        rel='noopener noreferrer'
-                        className='absolute top-3 left-3'
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleToggleFavorite();
+                      }}
+                      className='flex-shrink-0 hover:opacity-80 transition-opacity'
+                    >
+                      <FavoriteIcon filled={favorited} />
+                    </button>
+                    {/* 网盘搜索按钮 */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openDrawer('pansou');
+                      }}
+                      className='flex-shrink-0 hover:opacity-80 transition-opacity'
+                      title='搜索网盘资源'
+                    >
+                      <Cloud className='h-6 w-6 text-gray-700 dark:text-gray-300' />
+                    </button>
+                    {/* AI问片按钮 */}
+                    {aiEnabled && detail && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openDrawer('aiChat');
+                        }}
+                        className='flex-shrink-0 hover:opacity-80 transition-opacity'
+                        title='AI问片'
                       >
-                        <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
-                          <svg
-                            width='16'
-                            height='16'
-                            viewBox='0 0 24 24'
-                            fill='none'
-                            stroke='currentColor'
-                            strokeWidth='2'
-                            strokeLinecap='round'
-                            strokeLinejoin='round'
-                          >
-                            <path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'></path>
-                            <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'></path>
-                          </svg>
-                        </div>
-                      </a>
+                        <Sparkles className='h-6 w-6 text-gray-700 dark:text-gray-300' />
+                      </button>
                     )}
-                  </>
-                ) : (
-                  <span className='text-gray-600 dark:text-gray-400'>
-                    封面图片
-                  </span>
-                )}
+                    {/* 详情按钮 */}
+                    {detail && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openDrawer('detail');
+                        }}
+                        className='flex-shrink-0 hover:opacity-80 transition-opacity px-2 py-1 text-base font-medium text-gray-700 dark:text-gray-300'
+                        title='详情'
+                      >
+                        详
+                      </button>
+                    )}
+                    {/* 纠错按钮 - 仅小雅源显示 */}
+                    {detail && detail.source === 'xiaoya' && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openDrawer('correct');
+                        }}
+                        className='flex-shrink-0 hover:opacity-80 transition-opacity'
+                        title='纠错'
+                      >
+                        <AlertCircle className='h-6 w-6 text-gray-700 dark:text-gray-300' />
+                      </button>
+                    )}
+                    {/* 豆瓣评分显示 */}
+                    {doubanRating && doubanRating.value > 0 && (
+                      <div className='flex items-center gap-2 text-base font-normal'>
+                        {/* 星级显示 */}
+                        <div className='flex items-center gap-1'>
+                          {[1, 2, 3, 4, 5].map((star) => {
+                            const starValue = doubanRating.value / 2; // 转换为5星制
+                            const isFullStar = star <= Math.floor(starValue);
+                            const isHalfStar = !isFullStar && star <= Math.ceil(starValue) && starValue % 1 >= 0.25;
+
+                            return (
+                              <div key={star} className='relative w-5 h-5'>
+                                {isFullStar ? (
+                                  // 全星
+                                  <svg
+                                    className='w-5 h-5 text-yellow-400 fill-yellow-400'
+                                    viewBox='0 0 24 24'
+                                    xmlns='http://www.w3.org/2000/svg'
+                                  >
+                                    <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
+                                  </svg>
+                                ) : isHalfStar ? (
+                                  // 半星
+                                  <>
+                                    {/* 空星背景 */}
+                                    <svg
+                                      className='absolute w-5 h-5 text-gray-300 dark:text-gray-600 fill-gray-300 dark:fill-gray-600'
+                                      viewBox='0 0 24 24'
+                                      xmlns='http://www.w3.org/2000/svg'
+                                    >
+                                      <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
+                                    </svg>
+                                    {/* 半星遮罩 */}
+                                    <svg
+                                      className='absolute w-5 h-5 text-yellow-400 fill-yellow-400'
+                                      viewBox='0 0 24 24'
+                                      xmlns='http://www.w3.org/2000/svg'
+                                      style={{ clipPath: 'inset(0 50% 0 0)' }}
+                                    >
+                                      <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
+                                    </svg>
+                                  </>
+                                ) : (
+                                  // 空星
+                                  <svg
+                                    className='w-5 h-5 text-gray-300 dark:text-gray-600 fill-gray-300 dark:fill-gray-600'
+                                    viewBox='0 0 24 24'
+                                    xmlns='http://www.w3.org/2000/svg'
+                                  >
+                                    <path d='M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' />
+                                  </svg>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {/* 评分数值 */}
+                        <span className='text-gray-700 dark:text-gray-300 font-semibold'>
+                          {doubanRating.value.toFixed(1)}
+                        </span>
+                        {/* 评分人数 */}
+                        <span className='text-gray-500 dark:text-gray-400 text-sm'>
+                          ({doubanRating.count.toLocaleString()}人评价)
+                        </span>
+                      </div>
+                    )}
+                  </h1>
+
+                  {/* 关键信息行 */}
+                  <div className={`flex flex-wrap items-center gap-3 text-base mb-4 opacity-80 flex-shrink-0 ${tmdbBackdrop ? 'text-white' : ''}`}>
+                    {detail?.class && (
+                      <span className='text-green-600 font-semibold'>
+                        {detail.class}
+                      </span>
+                    )}
+                    {/* 优先使用 doubanYear，如果没有则使用 detail.year 或 videoYear */}
+                    {(doubanYear || detail?.year || videoYear) && (
+                      <span>{doubanYear || detail?.year || videoYear}</span>
+                    )}
+                    {detail?.source_name && (
+                      <span
+                        className={`relative group cursor-pointer border px-2 py-[1px] rounded ${
+                          detail.source === 'xiaoya' ? 'border-blue-500' : detail.source === 'openlist' || detail.source === 'emby' || detail.source?.startsWith('emby_') ? 'border-yellow-500' : 'border-gray-500/60'
+                        }`}
+                        onClick={fetchCurrentSourceVideoInfo}
+                      >
+                        {detail.source_name}
+                        {/* 视频信息悬浮提示 */}
+                        {currentSourceVideoInfo && (
+                          <div className='absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-800 dark:bg-gray-900 text-white text-sm rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 ease-out whitespace-nowrap z-[100] pointer-events-none'>
+                            <div className='text-sm'>
+                              <div>分辨率: {currentSourceVideoInfo.quality}</div>
+                              <div>码率: {currentSourceVideoInfo.bitrate}</div>
+                            </div>
+                            <div className='absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800 dark:border-t-gray-900'></div>
+                          </div>
+                        )}
+                      </span>
+                    )}
+                    {detail?.type_name && <span>{detail.type_name}</span>}
+                  </div>
+                  {/* 剧情简介 */}
+                  {(doubanCardSubtitle || correctedDesc || detail?.desc) && (
+                    <div
+                      className={`mt-0 text-base leading-relaxed opacity-90 overflow-y-auto pr-2 flex-1 min-h-0 scrollbar-hide ${tmdbBackdrop ? 'text-white' : ''}`}
+                      style={{ whiteSpace: 'pre-line' }}
+                    >
+                      {/* card_subtitle 在前，desc 在后 */}
+                      {doubanCardSubtitle && (
+                        <div className='mb-3 pb-3 border-b border-gray-300 dark:border-gray-700'>
+                          {doubanCardSubtitle}
+                        </div>
+                      )}
+                      {correctedDesc || detail?.desc}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* 封面展示 */}
+              <div className='hidden md:block md:col-span-1 md:order-first'>
+                <div className='pl-0 py-4 pr-6 max-w-sm mx-auto'>
+                  <div className='relative bg-gray-300 dark:bg-gray-700 aspect-[2/3] flex items-center justify-center rounded-xl overflow-hidden'>
+                    {videoCover ? (
+                      <>
+                        <img
+                          src={processImageUrl(videoCover)}
+                          alt={videoTitle}
+                          className='w-full h-full object-cover'
+                        />
+
+                        {/* 豆瓣链接按钮 */}
+                        {videoDoubanId !== 0 && (
+                          <a
+                            href={`https://movie.douban.com/subject/${videoDoubanId.toString()}`}
+                            target='_blank'
+                            rel='noopener noreferrer'
+                            className='absolute top-3 left-3'
+                          >
+                            <div className='bg-green-500 text-white text-xs font-bold w-8 h-8 rounded-full flex items-center justify-center shadow-md hover:bg-green-600 hover:scale-[1.1] transition-all duration-300 ease-out'>
+                              <svg
+                                width='16'
+                                height='16'
+                                viewBox='0 0 24 24'
+                                fill='none'
+                                stroke='currentColor'
+                                strokeWidth='2'
+                                strokeLinecap='round'
+                                strokeLinejoin='round'
+                              >
+                                <path d='M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71'></path>
+                                <path d='M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71'></path>
+                              </svg>
+                            </div>
+                          </a>
+                        )}
+                      </>
+                    ) : (
+                      <span className='text-gray-600 dark:text-gray-400'>
+                        封面图片
+                      </span>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
-        </div>
 
-        {/* 推荐区域 */}
-        <SmartRecommendations
-          doubanId={videoDoubanId !== 0 ? videoDoubanId : undefined}
-          videoTitle={videoTitle}
-        />
+            {/* 推荐区域 */}
+            <SmartRecommendations
+              doubanId={videoDoubanId !== 0 ? videoDoubanId : undefined}
+              videoTitle={videoTitle}
+            />
 
-        {/* 豆瓣评论区域 */}
-        {videoDoubanId !== 0 && enableComments && (
-          <div className='mt-6 -mx-3 md:mx-0 md:px-4'>
-            <div className='bg-white/50 dark:bg-gray-800/50 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-700/50 overflow-hidden'>
-              {/* 标题 */}
-              <div className='px-3 md:px-6 py-4 border-b border-gray-200 dark:border-gray-700'>
-                <h3 className='text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2'>
-                  <svg className='w-5 h-5' fill='currentColor' viewBox='0 0 24 24'>
-                    <path d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z'/>
-                  </svg>
-                  豆瓣评论
-                </h3>
+            {/* 豆瓣评论区域 */}
+            {videoDoubanId !== 0 && enableComments && (
+              <div className='mt-6 -mx-3 md:mx-0 md:px-4'>
+                <div className='bg-white/50 dark:bg-gray-800/50 backdrop-blur-sm rounded-xl border border-gray-200/50 dark:border-gray-700/50 overflow-hidden'>
+                  {/* 标题 */}
+                  <div className='px-3 md:px-6 py-4 border-b border-gray-200 dark:border-gray-700'>
+                    <h3 className='text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2'>
+                      <svg className='w-5 h-5' fill='currentColor' viewBox='0 0 24 24'>
+                        <path d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z'/>
+                      </svg>
+                      豆瓣评论
+                    </h3>
+                  </div>
+
+                  {/* 评论内容 */}
+                  <div className='p-3 md:p-6'>
+                    <DoubanComments doubanId={videoDoubanId} />
+                  </div>
+                </div>
               </div>
-
-              {/* 评论内容 */}
-              <div className='p-3 md:p-6'>
-                <DoubanComments doubanId={videoDoubanId} />
-              </div>
-            </div>
-          </div>
+            )}
+          </>
         )}
       </div>
 
@@ -7864,40 +8435,56 @@ function PlayPageClient() {
 
       {/* 网盘搜索弹窗 */}
       {showPansouDialog && (
-        <div
-          className='fixed inset-0 z-[10000] flex items-center justify-center bg-black/50'
-          onClick={() => setShowPansouDialog(false)}
-        >
-          <div
-            className='relative w-full max-w-4xl max-h-[80vh] overflow-y-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl m-4'
-            onClick={(e) => e.stopPropagation()}
+        isLargeScreen ? (
+          <Drawer
+            isOpen={showPansouDialog}
+            onClose={() => setShowPansouDialog(false)}
+            title={`搜索网盘资源: ${detail?.title || ''}`}
+            width='w-[400px]'
           >
-            {/* 弹窗头部 */}
-            <div className='sticky top-0 z-10 flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900'>
-              <h2 className='text-xl font-bold text-gray-900 dark:text-gray-100'>
-                搜索网盘资源: {detail?.title || ''}
-              </h2>
-              <button
-                onClick={() => setShowPansouDialog(false)}
-                className='p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors'
-              >
-                <X className='h-5 w-5 text-gray-600 dark:text-gray-400' />
-              </button>
-            </div>
-
-            {/* 弹窗内容 */}
             <div className='p-4'>
               <PansouSearch
                 keyword={detail?.title || ''}
                 triggerSearch={showPansouDialog}
               />
             </div>
+          </Drawer>
+        ) : (
+          <div
+            className='fixed inset-0 z-[10000] flex items-center justify-center bg-black/50'
+            onClick={() => setShowPansouDialog(false)}
+          >
+            <div
+              className='relative w-full max-w-4xl max-h-[80vh] overflow-y-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl m-4'
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* 弹窗头部 */}
+              <div className='sticky top-0 z-10 flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900'>
+                <h2 className='text-xl font-bold text-gray-900 dark:text-gray-100'>
+                  搜索网盘资源: {detail?.title || ''}
+                </h2>
+                <button
+                  onClick={() => setShowPansouDialog(false)}
+                  className='p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors'
+                >
+                  <X className='h-5 w-5 text-gray-600 dark:text-gray-400' />
+                </button>
+              </div>
+
+              {/* 弹窗内容 */}
+              <div className='p-4'>
+                <PansouSearch
+                  keyword={detail?.title || ''}
+                  triggerSearch={showPansouDialog}
+                />
+              </div>
+            </div>
           </div>
-        </div>
+        )
       )}
 
       {/* AI问片面板 */}
-      {aiEnabled && showAIChat && detail && (
+      {aiEnabled && detail && (
         <AIChatPanel
           isOpen={showAIChat}
           onClose={() => setShowAIChat(false)}
@@ -7908,6 +8495,8 @@ function PlayPageClient() {
             currentEpisode: currentEpisodeIndex + 1,
           }}
           welcomeMessage={aiDefaultMessageWithVideo ? aiDefaultMessageWithVideo.replace('{title}', detail.title || '') : `想了解《${detail.title}》的更多信息吗？我可以帮你查询剧情、演员、评价等。`}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
         />
       )}
 
@@ -7932,6 +8521,57 @@ function PlayPageClient() {
             // 纠错成功后的回调
             handleCorrectSuccess();
           }}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
+        />
+      )}
+
+      {/* 详情面板 */}
+      {detail && (
+        <DetailPanel
+          isOpen={showDetailPanel}
+          onClose={() => setShowDetailPanel(false)}
+          title={detail.title}
+          poster={detail.poster}
+          doubanId={
+            // 特殊源使用 tmdb，其他使用 cms（通过 doubanId）
+            // 如果有豆瓣ID且不为0，传入doubanId
+            detail.source === 'openlist' ||
+            detail.source?.startsWith('emby') ||
+            detail.source === 'xiaoya'
+              ? undefined
+              : detail.douban_id && detail.douban_id !== 0
+              ? detail.douban_id
+              : undefined
+          }
+          tmdbId={
+            // 特殊源使用 tmdb
+            detail.source === 'openlist' ||
+            detail.source?.startsWith('emby') ||
+            detail.source === 'xiaoya'
+              ? detail.tmdb_id
+              : undefined
+          }
+          type={detail.type_name === '电影' ? 'movie' : 'tv'}
+          currentEpisode={currentEpisodeIndex + 1}
+          cmsData={
+            // 非特殊源使用 cms 数据
+            // 但如果有豆瓣ID且不为0，则不传入cmsData，优先使用豆瓣数据
+            detail.source !== 'openlist' &&
+            !detail.source?.startsWith('emby') &&
+            detail.source !== 'xiaoya' &&
+            !(detail.douban_id && detail.douban_id !== 0)
+              ? {
+                  desc: detail.desc,
+                  episodes: detail.episodes,
+                  episodes_titles: detail.episodes_titles,
+                }
+              : undefined
+          }
+          sourceId={detail.id}
+          source={detail.source}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
         />
       )}
     </PageLayout>
